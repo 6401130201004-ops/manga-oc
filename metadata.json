@@ -1,0 +1,6 @@
+{
+  "name": "OmniToon AI",
+  "description": "AI-powered automated webtoon reader with multilingual real-time translation, character voice TTS, ambient scene music, auto-publishing pipeline, DMCA protection, and Stripe monetization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
