@@ -184,19 +184,29 @@ class AudioEngine {
     return this.currentPreset;
   }
 
+  private currentAudioElement: HTMLAudioElement | null = null;
+
   public isSpeaking(): boolean {
     return this.isSpeakingNow;
   }
 
   public stopSpeaking() {
+    this.isSpeakingNow = false;
+    if (this.currentAudioElement) {
+      try {
+        this.currentAudioElement.pause();
+        this.currentAudioElement.currentTime = 0;
+      } catch (e) {}
+      this.currentAudioElement = null;
+    }
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
-      this.isSpeakingNow = false;
     }
   }
 
   /**
-   * Speak character dialogue using Web Speech API with pitch, rate, and gender adaptation
+   * Speak character dialogue using real high-quality Gemini TTS AI voice first,
+   * with natural, pleasant human prosody fallback via Web Speech API.
    */
   public async speakCharacterVoice(
     text: string,
@@ -205,14 +215,78 @@ class AudioEngine {
     tone: string = 'neutral',
     customSettings?: Partial<VoiceSettings>
   ): Promise<void> {
+    // Strip meta tags like (หน้า 1) to guarantee clean dialogue
+    const cleanText = text.replace(/\s*\((?:หน้า|page)\s*\d+\)/gi, '').trim();
+    if (!cleanText) return;
+
+    this.stopSpeaking();
+    this.isSpeakingNow = true;
+
+    // 1. Try Gemini AI Neural TTS for studio-grade human natural voice
+    try {
+      const response = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: cleanText,
+          lang: lang === 'raw' ? 'th' : lang,
+          gender: gender === 'male' ? 'male' : 'female',
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.audio) {
+          return new Promise<void>((resolve) => {
+            const audio = new Audio(`data:${data.mimeType || 'audio/wav'};base64,${data.audio}`);
+            this.currentAudioElement = audio;
+
+            const vol = customSettings?.volume !== undefined ? customSettings.volume : 1.0;
+            audio.volume = Math.max(0, Math.min(1, vol));
+
+            audio.onended = () => {
+              this.isSpeakingNow = false;
+              this.currentAudioElement = null;
+              resolve();
+            };
+
+            audio.onerror = () => {
+              this.isSpeakingNow = false;
+              this.currentAudioElement = null;
+              resolve();
+            };
+
+            audio.play().catch(() => {
+              // Fallback to speech synthesis if autoplay blocked
+              this.fallbackSpeechSynthesis(cleanText, lang, gender, tone, customSettings)
+                .then(resolve);
+            });
+          });
+        }
+      }
+    } catch (e) {
+      // Network or API failure -> seamlessly fallback
+    }
+
+    // 2. Pleasant Natural Voice Fallback (Web Speech API)
+    return this.fallbackSpeechSynthesis(cleanText, lang, gender, tone, customSettings);
+  }
+
+  private fallbackSpeechSynthesis(
+    text: string,
+    lang: string,
+    gender: 'male' | 'female' | 'unknown',
+    _tone: string,
+    customSettings?: Partial<VoiceSettings>
+  ): Promise<void> {
     return new Promise((resolve) => {
       if (!('speechSynthesis' in window)) {
-        console.warn('Speech synthesis not supported in this browser.');
+        this.isSpeakingNow = false;
         resolve();
         return;
       }
 
-      window.speechSynthesis.cancel(); // Stop any pending speech
+      window.speechSynthesis.cancel();
       this.isSpeakingNow = true;
 
       const utterance = new SpeechSynthesisUtterance(text);
@@ -224,60 +298,34 @@ class AudioEngine {
       else if (lang === 'zh') utterance.lang = 'zh-CN';
       else utterance.lang = 'en-US';
 
-      // Pick matching browser voice if available
+      // Pick the best natural human voice
       try {
         const voices = window.speechSynthesis.getVoices();
         const prefix = lang === 'th' ? 'th' : lang === 'ja' ? 'ja' : lang === 'ko' ? 'ko' : 'en';
-        const matchingVoices = voices.filter((v) => v.lang.toLowerCase().startsWith(prefix));
+        const matchingVoices = voices.filter((v) => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
 
         if (matchingVoices.length > 0) {
-          if (gender === 'female') {
-            const femaleVoice = matchingVoices.find(
-              (v) =>
-                v.name.toLowerCase().includes('female') ||
-                v.name.toLowerCase().includes('woman') ||
-                v.name.includes('Siri') ||
-                v.name.includes('Google')
-            );
-            utterance.voice = femaleVoice || matchingVoices[0];
-          } else if (gender === 'male') {
-            const maleVoice = matchingVoices.find(
-              (v) =>
-                v.name.toLowerCase().includes('male') ||
-                v.name.toLowerCase().includes('man')
-            );
-            utterance.voice = maleVoice || matchingVoices[0];
-          } else {
-            utterance.voice = matchingVoices[0];
-          }
+          // Priority to high quality neural voices
+          const preferredVoice = matchingVoices.find(
+            (v) =>
+              v.name.includes('Google') ||
+              v.name.includes('Siri') ||
+              v.name.includes('Premwadee') ||
+              v.name.includes('Narisa') ||
+              v.name.includes('Natural')
+          );
+          utterance.voice = preferredVoice || matchingVoices[0];
         }
       } catch (e) {}
 
-      // Base rate and pitch
+      // Natural, pleasant Thai prosody: pitch 1.0 (never 0.78 or 1.28!), gentle rate 0.96-1.0
       const rateMultiplier = customSettings?.speed || 1.0;
-      const pitchMultiplier = customSettings?.pitch || 1.0;
       const volumeLevel = customSettings?.volume !== undefined ? customSettings.volume : 1.0;
 
       utterance.volume = Math.max(0, Math.min(1, volumeLevel));
-
-      // Character profile tone modulation
-      if (customSettings?.characterGenderTone !== false) {
-        if (gender === 'male') {
-          const malePitchBase = tone === 'brave' || tone === 'determined' ? 0.78 : 0.88;
-          utterance.pitch = malePitchBase * pitchMultiplier;
-          utterance.rate = (tone === 'angry' ? 1.08 : 0.96) * rateMultiplier;
-        } else if (gender === 'female') {
-          const femalePitchBase = tone === 'cheerful' ? 1.28 : 1.15;
-          utterance.pitch = femalePitchBase * pitchMultiplier;
-          utterance.rate = 1.0 * rateMultiplier;
-        } else {
-          utterance.pitch = 1.0 * pitchMultiplier;
-          utterance.rate = 1.0 * rateMultiplier;
-        }
-      } else {
-        utterance.pitch = 1.0 * pitchMultiplier;
-        utterance.rate = 1.0 * rateMultiplier;
-      }
+      // Tonal language natural pitch: stay very close to 1.0 for authentic Thai tones
+      utterance.pitch = gender === 'male' ? 0.98 : 1.03;
+      utterance.rate = 0.98 * rateMultiplier;
 
       utterance.onend = () => {
         this.isSpeakingNow = false;

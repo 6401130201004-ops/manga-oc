@@ -852,14 +852,59 @@ const RAW_INITIAL_COMICS: Comic[] = [
   },
 ];
 
+const UPDATE_SCHEDULE_MINUTES = [
+  10,  // Overlord of Insects - วันนี้ 10 นาทีที่แล้ว
+  25,  // Isekai Kara Elf-san - วันนี้ 25 นาทีที่แล้ว
+  40,  // Solo Leveling: Ragnarok - วันนี้ 40 นาทีที่แล้ว
+  55,  // Lookism - วันนี้ 55 นาทีที่แล้ว
+  75,  // Magic Emperor - วันนี้ 1 ชั่วโมงที่แล้ว
+  95,  // Nano Machine - วันนี้ 1.5 ชั่วโมงที่แล้ว
+  120, // Omniscient Reader - วันนี้ 2 ชั่วโมงที่แล้ว
+  150, // The Beginning After the End - วันนี้ 2.5 ชั่วโมงที่แล้ว
+  180, // Martial Peak - วันนี้ 3 ชั่วโมงที่แล้ว
+  220, // The Player That Can’t Level Up - วันนี้ 3.5 ชั่วโมงที่แล้ว
+  260, // Honzuki no Gekokujou - วันนี้ 4 ชั่วโมงที่แล้ว
+  310, // Eleceed - วันนี้ 5 ชั่วโมงที่แล้ว
+  370, // Infinite Mage - วันนี้ 6 ชั่วโมงที่แล้ว
+  430, // Disastrous Necromancer - วันนี้ 7 ชั่วโมงที่แล้ว
+  500, // Afterlife Diner - วันนี้ 8 ชั่วโมงที่แล้ว
+  580, // Reality Quest - วันนี้ 9 ชั่วโมงที่แล้ว
+  660, // A Modern Man in Murim - วันนี้ 11 ชั่วโมงที่แล้ว
+  740, // Return of the Mount Hua Sect - วันนี้ 12 ชั่วโมงที่แล้ว
+  1440 + 120, // Pick Me Up, Infinite Gacha - เมื่อวานนี้
+  1440 + 240, // SSS-Class Suicide Hunter - เมื่อวานนี้
+];
+
 export const INITIAL_COMICS: Comic[] = deduplicateComics(
-  RAW_INITIAL_COMICS.map((comic) => {
+  RAW_INITIAL_COMICS.map((comic, idx) => {
     const latestChapter = comic.chapters && comic.chapters.length > 0 ? comic.chapters[0] : null;
     const latestNum = latestChapter ? latestChapter.chapterNumber : 1;
     const initialPages = latestChapter && latestChapter.pages ? latestChapter.pages : [];
+
+    const minutesAgo = UPDATE_SCHEDULE_MINUTES[idx] ?? (idx * 30 + 10);
+    const updateTime = new Date(Date.now() - minutesAgo * 60 * 1000);
+    const isToday = minutesAgo < 1440;
+    const updateText = isToday
+      ? minutesAgo < 60
+        ? `วันนี้ (${minutesAgo} นาทีที่แล้ว)`
+        : `วันนี้ (${Math.floor(minutesAgo / 60)} ชม. ที่แล้ว)`
+      : 'เมื่อวานนี้';
+
     return {
       ...comic,
-      chapters: buildComprehensiveChapterList(comic.slug, latestNum, initialPages),
+      updatedAt: updateTime.toISOString(),
+      lastChapterUpdatedText: updateText,
+      chapters: buildComprehensiveChapterList(
+        comic.slug,
+        latestNum,
+        initialPages,
+        `ตอนใหม่ • ${updateText}`
+      ),
     };
+  }).sort((a, b) => {
+    const tA = new Date(a.updatedAt || 0).getTime();
+    const tB = new Date(b.updatedAt || 0).getTime();
+    return tB - tA;
   })
 );
+

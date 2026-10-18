@@ -30,6 +30,7 @@ export interface Chapter {
   chapterNumber: number;
   title: string;
   publishedAt: string;
+  ambientMood?: string;
   isUnlocked?: boolean;
   pages: ComicPage[];
 }
@@ -51,6 +52,8 @@ export interface Comic {
   originalLang: string;
   chapters: Chapter[];
   isAiGenerated?: boolean;
+  updatedAt?: string;
+  lastChapterUpdatedText?: string;
 }
 
 export interface AdCampaign {

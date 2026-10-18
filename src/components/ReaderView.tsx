@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   ArrowLeft, ChevronLeft, ChevronRight, Volume2, VolumeX, 
-  Globe, Play, Pause, ChevronUp, FastForward, Sliders, Sparkles
+  Globe, Play, Pause, ChevronUp, FastForward, Sliders, Sparkles, Music
 } from 'lucide-react';
 import { Comic, Chapter, ComicPage, DialogBubble, Language } from '../types/comic';
-import { audioEngine, VoiceSettings, SlideSettings } from '../services/audioEngine';
+import { 
+  audioEngine, VoiceSettings, SlideSettings, 
+  mapGenreOrMoodToBgmPreset, BGM_PRESET_LABELS, BgmPresetKey 
+} from '../services/audioEngine';
 import { CoffeeSupportCard } from './CoffeeSupportCard';
 import { generateWebtoonPanelSvg } from '../utils/comicPageGenerator';
 import { ReaderSettingsModal } from './ReaderSettingsModal';
@@ -25,11 +28,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 }) => {
   const [selectedLang, setSelectedLang] = useState<Language>('th');
   const [isBgmActive, setIsBgmActive] = useState<boolean>(false);
-  const [bgmPreset, setBgmPreset] = useState<string>('dungeon_ambient');
+  const [bgmPreset, setBgmPreset] = useState<string>(() => 
+    mapGenreOrMoodToBgmPreset(comic.genres, `${chapter.ambientMood || ''} ${chapter.title || ''} ${comic.synopsis || ''}`)
+  );
   const [activeBubbleId, setActiveBubbleId] = useState<string | null>(null);
   const [activeSpeakingText, setActiveSpeakingText] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const [showBubbles, setShowBubbles] = useState<boolean>(true);
+  const [readingProgress, setReadingProgress] = useState<number>(0);
+  const [isAutoNarrating, setIsAutoNarrating] = useState<boolean>(false);
 
   // Voice Settings State
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettings>(() => {
@@ -86,6 +93,72 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   useEffect(() => {
     localStorage.setItem('mangaoc_slide_settings', JSON.stringify(slideSettings));
   }, [slideSettings]);
+
+  // Auto-detect and adapt BGM preset based on chapter mood or comic genre
+  useEffect(() => {
+    const detected = mapGenreOrMoodToBgmPreset(
+      comic.genres,
+      `${chapter.ambientMood || ''} ${chapter.title || ''} ${comic.synopsis || ''}`
+    );
+    setBgmPreset(detected);
+    if (isBgmActive) {
+      audioEngine.setPreset(detected);
+    }
+  }, [comic, chapter, isBgmActive]);
+
+  // Audio cleanup on unmount
+  useEffect(() => {
+    return () => {
+      audioEngine.stopBGM();
+      audioEngine.stopSpeaking();
+    };
+  }, []);
+
+  // Track scroll position, visual progress bar, and save Continue Reading state
+  useEffect(() => {
+    const handleScroll = () => {
+      const scrollY = window.scrollY;
+      const totalHeight = document.documentElement.scrollHeight - window.innerHeight;
+      const progress = totalHeight > 0 ? Math.min(100, Math.max(0, (scrollY / totalHeight) * 100)) : 0;
+      setReadingProgress(Math.round(progress));
+
+      // Save continue reading progress to localStorage
+      try {
+        const payload = {
+          comicId: comic.id,
+          comicSlug: comic.slug,
+          comicTitle: comic.title,
+          coverImage: comic.coverImage,
+          chapterId: chapter.id,
+          chapterNumber: chapter.chapterNumber,
+          chapterTitle: chapter.title,
+          scrollY,
+          progressPercent: Math.round(progress),
+          updatedAt: new Date().toISOString(),
+        };
+        localStorage.setItem(`mangaoc_continue_${comic.slug}`, JSON.stringify(payload));
+        localStorage.setItem('mangaoc_last_read_comic', JSON.stringify(payload));
+      } catch (e) {}
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, [comic, chapter]);
+
+  // Resume last scroll position on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(`mangaoc_continue_${comic.slug}`);
+      if (saved) {
+        const data = JSON.parse(saved);
+        if (data.chapterNumber === chapter.chapterNumber && data.scrollY > 150) {
+          setTimeout(() => {
+            window.scrollTo({ top: data.scrollY, behavior: 'smooth' });
+          }, 450);
+        }
+      }
+    } catch (e) {}
+  }, [comic.slug, chapter.chapterNumber]);
 
   // Loaded pages
   const [loadedPages, setLoadedPages] = useState<ComicPage[]>(chapter.pages);
@@ -279,19 +352,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   };
 
-  // Speak character speech bubble
-  const handleSpeakBubble = async (bubble: DialogBubble) => {
+  // Speak character speech bubble - text is 100% identical to speech bubble
+  const handleSpeakBubble = async (bubble: DialogBubble, overrideText?: string) => {
     if (!voiceSettings.enabled) return;
     setActiveBubbleId(bubble.id);
 
-    const textToSpeak =
+    const rawText = overrideText || (
       selectedLang === 'th' ? bubble.th :
       selectedLang === 'en' ? bubble.en :
       selectedLang === 'ja' ? bubble.ja :
       selectedLang === 'ko' ? bubble.ko :
-      bubble.originalText;
+      bubble.originalText
+    );
+    // Strip meta tags like (หน้า 1) so spoken text matches bubble dialogue cleanly
+    const textToSpeak = (rawText || '').replace(/\s*\((?:หน้า|page)\s*\d+\)/gi, '').trim();
 
-    setActiveSpeakingText(`${bubble.speaker}: "${textToSpeak}"`);
+    setActiveSpeakingText(`"${textToSpeak}"`);
 
     await audioEngine.speakCharacterVoice(
       textToSpeak,
@@ -305,6 +381,38 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     setActiveBubbleId((prev) => (prev === bubble.id ? null : prev));
   };
 
+  // Sequential character voice auto narration loop
+  useEffect(() => {
+    if (!isAutoNarrating || !loadedPages || loadedPages.length === 0) return;
+
+    let isCancelled = false;
+    const allBubbles = loadedPages.flatMap((p) => p.bubbles || []);
+    if (allBubbles.length === 0) return;
+
+    let currentIndex = 0;
+
+    const narrateNext = async () => {
+      if (isCancelled || currentIndex >= allBubbles.length) {
+        if (!isCancelled) setIsAutoNarrating(false);
+        return;
+      }
+
+      const bubble = allBubbles[currentIndex];
+      await handleSpeakBubble(bubble);
+
+      if (isCancelled) return;
+      currentIndex++;
+      setTimeout(narrateNext, 600);
+    };
+
+    narrateNext();
+
+    return () => {
+      isCancelled = true;
+      audioEngine.stopSpeaking();
+    };
+  }, [isAutoNarrating, loadedPages, selectedLang]);
+
   const langLabels: Record<Language, { label: string; flag: string }> = {
     th: { label: 'ภาษาไทย (แปลลื่นไหล)', flag: '🇹🇭' },
     en: { label: 'English', flag: '🇬🇧' },
@@ -315,8 +423,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   return (
     <div className="min-h-screen bg-[#fff5f7] text-slate-800 flex flex-col items-center select-none font-sans">
-      {/* 1. Top Pastel Pink Sticky Navigation Bar */}
+      {/* 1. Top Pastel Pink Sticky Navigation Bar with Visual Progress Bar */}
       <header className="sticky top-0 z-40 w-full bg-[#f472b6] text-white shadow-md">
+        {/* Visual Reading Progress Bar */}
+        <div className="w-full h-1 bg-white/25 overflow-hidden relative">
+          <div 
+            className="h-full bg-gradient-to-r from-amber-300 via-yellow-200 to-white transition-all duration-100 ease-out shadow-xs"
+            style={{ width: `${readingProgress}%` }}
+          />
+        </div>
+
         <div className="max-w-4xl mx-auto px-3 sm:px-4 h-13 flex items-center justify-between gap-2">
           {/* Back button & Title */}
           <div className="flex items-center gap-2 overflow-hidden">
@@ -332,7 +448,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 {comic.title}
               </h1>
               <p className="text-[10px] text-pink-100 font-medium">
-                {chapter.title} • อ่านฟรี ({loadedPages.length} หน้า)
+                {chapter.title} • อ่านแล้ว <span className="font-bold text-white bg-white/20 px-1 py-0.2 rounded-md">{readingProgress}%</span> ({loadedPages.length} หน้า)
               </p>
             </div>
           </div>
@@ -358,6 +474,27 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </span>
             </button>
 
+            {/* Ambient BGM Button (Mood & Genre Driven) */}
+            <button
+              onClick={handleToggleBgm}
+              className={`px-2.5 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all shadow-xs ${
+                isBgmActive
+                  ? 'bg-purple-600 hover:bg-purple-700 text-white ring-2 ring-purple-300 animate-pulse'
+                  : 'bg-white/20 hover:bg-white/30 text-white'
+              }`}
+              title={`เพลงบรรยากาศปรับตามอารมณ์: ${BGM_PRESET_LABELS[bgmPreset as BgmPresetKey]?.label || bgmPreset}`}
+            >
+              <span>{BGM_PRESET_LABELS[bgmPreset as BgmPresetKey]?.icon || '🎵'}</span>
+              <span className="hidden sm:inline">{isBgmActive ? 'BGM เล่นอยู่' : 'เปิดเพลง BGM'}</span>
+              {isBgmActive && (
+                <span className="flex items-center gap-0.5">
+                  <span className="w-1 h-3 bg-white rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1 h-3.5 bg-white rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                </span>
+              )}
+            </button>
+
             {/* Easy Customization Menu Trigger Button */}
             <button
               onClick={() => setIsSettingsOpen(true)}
@@ -366,20 +503,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             >
               <Sliders className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">ปรับแต่ง</span>
-            </button>
-
-            {/* Ambient BGM Button */}
-            <button
-              onClick={handleToggleBgm}
-              className={`p-1.5 sm:px-2.5 sm:py-1 rounded-xl text-xs font-semibold flex items-center gap-1 transition-all ${
-                isBgmActive
-                  ? 'bg-white text-[#db2777] shadow-sm'
-                  : 'bg-white/20 hover:bg-white/30 text-white'
-              }`}
-              title={isBgmActive ? 'ปิดเสียงบรรยากาศ' : 'เปิดเสียงบรรยากาศมังงะ'}
-            >
-              {isBgmActive ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
-              <span className="hidden sm:inline text-[11px]">{isBgmActive ? 'เปิดเพลง' : 'ปิดเพลง'}</span>
             </button>
 
             {/* Chapter Selector Dropdown */}
@@ -616,18 +739,40 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           <span>{slideSettings.enabled ? 'หยุดสไลด์' : 'สไลด์อัตโนมัติ'}</span>
         </button>
 
-        {/* Voice Toggle Button (เสียงอ่าน) */}
+        {/* Voice Auto-Narrate / Manual Toggle Button */}
         <button
-          onClick={() => setVoiceSettings((prev) => ({ ...prev, enabled: !prev.enabled }))}
-          className={`p-1.5 sm:px-2.5 sm:py-1.5 rounded-xl text-xs font-bold transition-all ${
-            voiceSettings.enabled
-              ? 'bg-pink-50 border border-pink-200 text-[#db2777]'
+          onClick={() => {
+            if (!voiceSettings.enabled) {
+              setVoiceSettings((prev) => ({ ...prev, enabled: true }));
+            }
+            setIsAutoNarrating((prev) => !prev);
+          }}
+          className={`px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all shadow-xs flex items-center gap-1 ${
+            isAutoNarrating
+              ? 'bg-purple-600 text-white animate-pulse ring-2 ring-purple-300'
+              : voiceSettings.enabled
+              ? 'bg-pink-50 border border-pink-200 text-[#db2777] hover:bg-pink-100'
               : 'bg-slate-100 text-slate-400'
           }`}
-          title={voiceSettings.enabled ? 'ปิดเสียงพากย์' : 'เปิดเสียงพากย์'}
+          title={isAutoNarrating ? 'หยุดการพากย์เสียงต่อเนื่อง' : 'เปิดการพากย์เสียงบทสนทนาต่อเนื่อง'}
         >
-          {voiceSettings.enabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+          {isAutoNarrating ? (
+            <Volume2 className="w-3.5 h-3.5 animate-bounce" />
+          ) : voiceSettings.enabled ? (
+            <Volume2 className="w-3.5 h-3.5" />
+          ) : (
+            <VolumeX className="w-3.5 h-3.5" />
+          )}
+          <span className="hidden sm:inline">{isAutoNarrating ? 'กำลังพากย์' : 'พากย์เสียง'}</span>
         </button>
+
+        {/* Visual Progress Badge */}
+        <div 
+          className="px-2 py-1 bg-pink-50 rounded-xl border border-pink-200 text-[#db2777] font-black text-[11px] flex items-center gap-0.5 shadow-2xs"
+          title={`อ่านถึง ${readingProgress}% ของตอนนี้`}
+        >
+          <span>{readingProgress}%</span>
+        </div>
 
         {/* Settings Menu Button */}
         <button

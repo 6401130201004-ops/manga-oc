@@ -12,12 +12,11 @@ import { AdSponsorshipModal } from './components/AdSponsorshipModal';
 import { AdminPortalModal } from './components/AdminPortalModal';
 import { ActiveAdPopup } from './components/ActiveAdPopup';
 import { generateProfessionalContinuousChapter, getCreditResetStatus } from './services/aiWriterService';
-import { subscribeToRealtimeMangaUpdates, triggerManualSyncCheck, triggerSyncAllChapters } from './services/realtimeSyncService';
-import { deduplicateComics, deduplicateChapters } from './utils/chapterGenerator';
-import { AiAutonomousBrainWidget } from './components/AiAutonomousBrainWidget';
-import { Lock, Sparkles, Coffee, Megaphone, Clock, Radio, RefreshCw } from 'lucide-react';
+import { subscribeToRealtimeMangaUpdates } from './services/realtimeSyncService';
+import { deduplicateComics, deduplicateChapters, getComicUpdateTimestamp, isComicUpdatedToday, getCanonicalStoryKey } from './utils/chapterGenerator';
+import { Lock, Sparkles, Coffee, Megaphone, Clock, Play, Flame, ArrowUpDown } from 'lucide-react';
 
-const COMICS_STORAGE_KEY = 'mangaoc_comics_v6';
+const COMICS_STORAGE_KEY = 'mangaoc_comics_v9_canonical';
 
 export default function App() {
   const [comics, setComics] = useState<Comic[]>(() => {
@@ -25,15 +24,20 @@ export default function App() {
       const saved = localStorage.getItem(COMICS_STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length >= 20) {
-          // Merge saved state with full chapter list and deduplicate completely
-          const merged = parsed.map((c: Comic) => {
-            const initialMatch = INITIAL_COMICS.find(ic => ic.slug === c.slug || ic.id === c.id);
-            const combinedChapters = deduplicateChapters([...(c.chapters || []), ...(initialMatch?.chapters || [])]);
-            return {
-              ...c,
-              chapters: combinedChapters,
-            };
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Merge any saved chapters strictly into the 20 canonical INITIAL_COMICS
+          const merged = INITIAL_COMICS.map((canonicalComic) => {
+            const canonKey = getCanonicalStoryKey(canonicalComic);
+            const matched = parsed.find((p: Comic) => getCanonicalStoryKey(p) === canonKey);
+            if (matched) {
+              return {
+                ...canonicalComic,
+                updatedAt: matched.updatedAt || canonicalComic.updatedAt,
+                lastChapterUpdatedText: matched.lastChapterUpdatedText || canonicalComic.lastChapterUpdatedText,
+                chapters: deduplicateChapters([...(matched.chapters || []), ...(canonicalComic.chapters || [])]),
+              };
+            }
+            return canonicalComic;
           });
           return deduplicateComics(merged);
         }
@@ -45,9 +49,10 @@ export default function App() {
   const [selectedComic, setSelectedComic] = useState<Comic | null>(null);
   const [activeReading, setActiveReading] = useState<{ comic: Comic; chapter: Chapter } | null>(null);
 
-  // Modals & Navigation
+  // Modals, Navigation & Sorting
   const [currentTab, setCurrentTab] = useState<'home' | 'reader' | 'pipeline' | 'dmca' | 'monetization'>('home');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<'latest_update' | 'rating' | 'views' | 'chapters' | 'title'>('latest_update');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   const [isDmcaOpen, setIsDmcaOpen] = useState(false);
@@ -56,14 +61,65 @@ export default function App() {
   const [isAdOpen, setIsAdOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
 
+  // Continue Reading State (resumes exact chapter & scroll)
+  const [continueReading, setContinueReading] = useState<any>(() => {
+    try {
+      const raw = localStorage.getItem('mangaoc_last_read_comic');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('mangaoc_last_read_comic');
+      if (raw) {
+        setContinueReading(JSON.parse(raw));
+      }
+    } catch (e) {}
+  }, [activeReading]);
+
+  const handleResumeReading = () => {
+    if (!continueReading) return;
+    const targetComic = comics.find(
+      (c) => c.slug === continueReading.comicSlug || c.id === continueReading.comicId
+    );
+    if (!targetComic) return;
+    const targetChapter = targetComic.chapters.find(
+      (ch) => ch.chapterNumber === continueReading.chapterNumber
+    ) || targetComic.chapters[0];
+
+    if (targetChapter) {
+      setActiveReading({ comic: targetComic, chapter: targetChapter });
+    }
+  };
+
+  const handleChapterAdded = (comicSlug: string, newChapter: Chapter) => {
+    setComics((prevComics) => {
+      const canonKey = getCanonicalStoryKey({ slug: comicSlug });
+      const target = prevComics.find((c) => getCanonicalStoryKey(c) === canonKey);
+      if (!target) return prevComics;
+
+      const chapters = deduplicateChapters([newChapter, ...(target.chapters || [])]);
+      const updated: Comic = {
+        ...target,
+        chapters,
+        updatedAt: new Date().toISOString(),
+        lastChapterUpdatedText: `เพิ่งอัปเดต (${newChapter.title})`,
+        viewCount: target.viewCount + 100,
+      };
+
+      const remaining = prevComics.filter((c) => getCanonicalStoryKey(c) !== canonKey);
+      return deduplicateComics([updated, ...remaining]);
+    });
+  };
+
   // Gmail User State
   const [currentUser, setCurrentUser] = useState<{ name: string; email: string; avatar: string } | null>(() => {
     const saved = localStorage.getItem('mangaoc_user');
     return saved ? JSON.parse(saved) : null;
   });
-
-  // Recent AI Toast Notification
-  const [aiToast, setAiToast] = useState<string | null>(null);
 
   useEffect(() => {
     localStorage.setItem(COMICS_STORAGE_KEY, JSON.stringify(comics));
@@ -77,9 +133,7 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // Live Credit Reset Countdown & Autonomous Writing Loop
-  const [creditSecondsLeft, setCreditSecondsLeft] = useState<number>(75);
-
+  // Silent Autonomous Background Development & Chapter Publishing
   const executeAiAutoWrite = () => {
     setComics((prevComics) => {
       if (!prevComics || prevComics.length === 0) return prevComics;
@@ -87,81 +141,57 @@ export default function App() {
       const targetComic = prevComics[targetIndex];
       const { updatedComic, newLog } = generateProfessionalContinuousChapter(targetComic);
 
-      setAiToast(`✨ AI เขียนและวาดตอนใหม่ต่อเนื่อง: "${targetComic.title}" ตอนที่ ${newLog.chapterNumber} (9 หน้า) สำเร็จ!`);
-      setTimeout(() => setAiToast(null), 5000);
+      const enhancedComic: Comic = {
+        ...updatedComic,
+        updatedAt: new Date().toISOString(),
+        lastChapterUpdatedText: `เพิ่งอัปเดต (ตอนที่ ${newLog.chapterNumber})`,
+      };
 
-      const nextList = [...prevComics];
-      nextList[targetIndex] = updatedComic;
-      return nextList;
+      const canonKey = getCanonicalStoryKey(targetComic);
+      const remaining = prevComics.filter((c) => getCanonicalStoryKey(c) !== canonKey);
+      return deduplicateComics([enhancedComic, ...remaining]);
     });
   };
 
   useEffect(() => {
+    // Runs autonomously in the background every 60s
     const timer = setInterval(() => {
-      setCreditSecondsLeft((prev) => {
-        if (prev <= 1) {
-          // Credit cycle reset reached: Trigger autonomous chapter writing!
-          executeAiAutoWrite();
-          return 75; // Reset back to full cycle
-        }
-        return prev - 1;
-      });
-    }, 1000);
+      executeAiAutoWrite();
+    }, 60000);
 
     return () => clearInterval(timer);
   }, []);
 
-  // 100% Autonomous Realtime Sync: Check external websites (sing-manga, flash-manga, manga-lc)
-  const [syncedCount, setSyncedCount] = useState<number>(0);
-  const [isSyncingLive, setIsSyncingLive] = useState<boolean>(false);
-
+  // Silent Realtime Sync: Receives new chapters and updates canonically in background
   useEffect(() => {
     const unsubscribe = subscribeToRealtimeMangaUpdates(
       (event) => {
         setComics((prevComics) => {
-          const target = prevComics.find((c) => c.id === event.comicId || c.slug === event.comicId);
+          const eventCanon = getCanonicalStoryKey({ id: event.comicId, slug: event.comicId, title: event.comicTitle });
+          const target = prevComics.find((c) => getCanonicalStoryKey(c) === eventCanon);
           if (!target) return prevComics;
 
           // Check if chapter already exists
           const exists = target.chapters.some((ch) => ch.chapterNumber === event.chapter.chapterNumber);
           if (exists) return prevComics;
 
-          setSyncedCount((c) => c + 1);
-          setAiToast(`⚡ AI ตรวจพบตอนใหม่: "${target.title}" ${event.chapter.title} (ภาพคมชัด คัดกรองไร้โฆษณาแทรก 100%) อัปเดตเรียบร้อยแล้ว`);
-          setTimeout(() => setAiToast(null), 5000);
+          const updated: Comic = {
+            ...target,
+            chapters: deduplicateChapters([event.chapter, ...target.chapters]),
+            updatedAt: new Date().toISOString(),
+            lastChapterUpdatedText: `เพิ่งอัปเดต (${event.chapter.title})`,
+            viewCount: target.viewCount + 150,
+          };
 
-          return prevComics.map((c) => {
-            if (c.id === target.id) {
-              return {
-                ...c,
-                chapters: [event.chapter, ...c.chapters],
-                viewCount: c.viewCount + 150,
-              };
-            }
-            return c;
-          });
+          const remaining = prevComics.filter((c) => getCanonicalStoryKey(c) !== eventCanon);
+          return deduplicateComics([updated, ...remaining]);
         });
-      },
-      (stats) => {
-        if (stats.totalCrawledChapters) {
-          setSyncedCount(stats.totalCrawledChapters);
-        }
       }
     );
 
     return () => unsubscribe();
   }, []);
 
-  const handleManualSyncCheck = async () => {
-    setIsSyncingLive(true);
-    setAiToast('⚡ AI กำลังสแกนดึงตอนใหม่ทุกเรื่อง ตัดเรื่องและตอนซ้ำออก 100%...');
-    const res = await triggerSyncAllChapters();
-    setTimeout(() => {
-      setIsSyncingLive(false);
-      setAiToast(`✅ AI ซิงค์และอัปเดตตอนใหม่สดเรียบร้อยแล้ว (${res.syncedCount || 6} ตอนล่าสุด) พร้อมอ่านทันที`);
-      setTimeout(() => setAiToast(null), 4000);
-    }, 1200);
-  };
 
   const handleSelectTab = (tab: 'home' | 'reader' | 'pipeline' | 'dmca' | 'monetization') => {
     if (tab === 'dmca') {
@@ -195,6 +225,28 @@ export default function App() {
 
     return matchesCategory && matchesSearch;
   });
+
+  // Sort comics based on user selection or default latest update (วันนี้/ตอนใหม่ล่าสุด)
+  const sortedAndFilteredComics = [...filteredComics].sort((a, b) => {
+    if (sortBy === 'latest_update') {
+      return getComicUpdateTimestamp(b) - getComicUpdateTimestamp(a);
+    }
+    if (sortBy === 'rating') {
+      return b.rating - a.rating;
+    }
+    if (sortBy === 'views') {
+      return b.viewCount - a.viewCount;
+    }
+    if (sortBy === 'chapters') {
+      return (b.chapters?.length || 0) - (a.chapters?.length || 0);
+    }
+    if (sortBy === 'title') {
+      return a.title.localeCompare(b.title, 'th');
+    }
+    return 0;
+  });
+
+  const updatedTodayCount = comics.filter(isComicUpdatedToday).length;
 
   // View 1: Active Reader View (สไลด์ยาวต่อเนื่อง ไร้รอยต่อ + อ่านอัตโนมัติ + QR ค่ากาแฟท้ายเรื่อง)
   if (activeReading) {
@@ -269,6 +321,7 @@ export default function App() {
           onLogin={setCurrentUser}
           onLogout={() => setCurrentUser(null)}
         />
+
       </div>
     );
   }
@@ -290,15 +343,6 @@ export default function App() {
         onOpenAuthModal={() => setIsAuthOpen(true)}
       />
 
-      {/* AI Daily Writer Toast Notification */}
-      {aiToast && (
-        <div className="fixed top-16 right-4 z-50 max-w-sm bg-white border-2 border-pink-300 rounded-2xl p-3 shadow-xl flex items-center gap-2.5 text-xs text-slate-800 animate-in slide-in-from-top duration-300">
-          <div className="w-8 h-8 rounded-xl bg-pink-100 text-[#db2777] flex items-center justify-center flex-shrink-0">
-            <Sparkles className="w-4 h-4" />
-          </div>
-          <div className="flex-1 font-semibold">{aiToast}</div>
-        </div>
-      )}
 
       <main className="max-w-7xl w-full mx-auto px-4 py-4 space-y-4 flex-1">
         {/* Soft Pastel Member Banner */}
@@ -334,87 +378,140 @@ export default function App() {
           </div>
         </div>
 
-        {/* 24/7 Autonomous AI Brain & Self-Evolving Engine */}
-        <AiAutonomousBrainWidget />
+        {/* Continue Reading Banner (อ่านต่อจากที่ค้างไว้) */}
+        {continueReading && (
+          <div className="p-3.5 bg-gradient-to-r from-purple-50 via-pink-50 to-rose-50 rounded-2xl border-2 border-pink-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs animate-in fade-in">
+            <div className="flex items-center gap-3">
+              {continueReading.coverImage && (
+                <img
+                  src={continueReading.coverImage}
+                  alt={continueReading.comicTitle}
+                  className="w-11 h-15 object-cover rounded-xl shadow-xs border border-pink-200 flex-shrink-0"
+                  onError={(e) => {
+                    e.currentTarget.src = 'https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=400&auto=format&fit=crop&q=60';
+                  }}
+                />
+              )}
+              <div className="space-y-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="px-2 py-0.5 rounded-full bg-pink-100 text-[#db2777] font-black text-[10px] uppercase">
+                    อ่านต่อจากจุดเดิม
+                  </span>
+                  <span className="text-[11px] text-slate-500 font-bold">
+                    อ่านแล้ว {continueReading.progressPercent}%
+                  </span>
+                </div>
+                <h3 className="font-black text-slate-800 text-sm line-clamp-1">
+                  {continueReading.comicTitle}
+                </h3>
+                <p className="text-[11px] text-slate-600 font-medium">
+                  {continueReading.chapterTitle} • เลื่อนลงถึงตำแหน่งเดิมอัตโนมัติ
+                </p>
+                <div className="w-44 sm:w-56 h-1.5 bg-pink-100 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-gradient-to-r from-pink-500 via-rose-500 to-purple-600 rounded-full" 
+                    style={{ width: `${continueReading.progressPercent || 15}%` }}
+                  />
+                </div>
+              </div>
+            </div>
 
-        {/* Realtime External Content Stream Banner */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-gradient-to-r from-emerald-50 via-teal-50/50 to-pink-50 rounded-2xl border border-emerald-200/80 shadow-xs text-xs">
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-3 w-3">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-            </span>
-            <div>
-              <span className="font-black text-slate-800 block sm:inline">
-                ดึงการ์ตูนทุกเรื่องทุกตอน • คัดกรองภาพแท้ ตัดเรื่องและตอนซ้ำออก 100%
+            <button
+              onClick={handleResumeReading}
+              className="py-2.5 px-4 rounded-xl bg-gradient-to-r from-pink-500 to-rose-500 hover:from-pink-600 hover:to-rose-600 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md transition-transform active:scale-95 flex-shrink-0"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>อ่านต่อทันที ({continueReading.progressPercent}%)</span>
+            </button>
+          </div>
+        )}
+
+        {/* Catalog Section Header & Sorting Bar */}
+        <div className="space-y-3">
+          {/* Announcement of today's updates - Home page is Updated Today */}
+          <div className="bg-gradient-to-r from-rose-50 via-pink-50 to-orange-50 border border-pink-200/90 rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-xs">
+            <div className="flex items-center gap-2.5">
+              <span className="p-2 rounded-xl bg-gradient-to-tr from-pink-500 to-rose-500 text-white shadow-xs">
+                <Flame className="w-4 h-4 fill-white" />
               </span>
-              <span className="text-[11px] text-slate-500 sm:ml-2">
-                (อัปเดตใหม่ตลอดเวลา 24 ชม. ตัดโฆษณาต้นทางออก สไลด์ลื่นไหล)
-              </span>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-black text-xs sm:text-sm text-slate-800">
+                    หน้าแรก • อัปเดตใหม่วันนี้ ({updatedTodayCount} เรื่องล่าสุด)
+                  </span>
+                  <span className="bg-rose-500 text-white font-extrabold text-[9px] px-2 py-0.5 rounded-full uppercase tracking-wider animate-pulse">
+                    UPDATED TODAY
+                  </span>
+                </div>
+                <span className="text-[11px] text-pink-700/80 block sm:inline font-medium">
+                  เรียงลำดับตามการอัปตอนใหม่ล่าสุดให้อัตโนมัติ (เรื่องที่มีตอนใหม่จะอยู่บนสุดทันที)
+                </span>
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-bold text-emerald-800 bg-emerald-100/80 px-2.5 py-1 rounded-xl">
-              ดึงตอนใหม่แล้ว: {syncedCount} ตอน
-            </span>
-            <button
-              onClick={handleManualSyncCheck}
-              disabled={isSyncingLive}
-              className="px-2.5 py-1 rounded-xl bg-white hover:bg-emerald-50 border border-emerald-200 text-emerald-700 font-bold text-[11px] shadow-2xs flex items-center gap-1 transition-transform active:scale-95 disabled:opacity-50"
-              title="ดึงตอนใหม่สดทุกเรื่องพร้อมตัดตอนซ้ำ"
-            >
-              <RefreshCw className={`w-3 h-3 ${isSyncingLive ? 'animate-spin text-emerald-600' : ''}`} />
-              <span>{isSyncingLive ? 'กำลังดึงใหม่...' : 'ดึงตอนใหม่สดทุกเรื่อง'}</span>
-            </button>
-          </div>
-        </div>
 
-        {/* Live Autonomous AI Writer Status Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-gradient-to-r from-pink-50 via-white to-pink-50 rounded-2xl border border-pink-200 shadow-sm text-xs">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-[#db2777]" />
-            <span className="font-bold text-slate-800">
-              AI นักเขียนมืออาชีพ: แต่งเรื่องและวาดภาพต่อเนื่องอัตโนมัติ (1 ตอน = 9 หน้าเต็ม)
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1 font-mono font-bold text-[#db2777] bg-white px-2.5 py-1 rounded-xl border border-pink-200 shadow-xs">
-              <Clock className="w-3.5 h-3.5 text-pink-500" />
-              <span>รอบรีเซ็ตเครดิต: {creditSecondsLeft}s</span>
-            </span>
-            <button
-              onClick={executeAiAutoWrite}
-              className="px-3 py-1 rounded-xl bg-[#db2777] hover:bg-[#be185d] text-white font-bold text-xs shadow-sm transition-transform active:scale-95 flex items-center gap-1"
-            >
-              <Sparkles className="w-3 h-3" />
-              <span>สั่งให้ AI เขียนทันที</span>
-            </button>
-          </div>
-        </div>
+          {/* Catalog Title + Sorting Selector */}
+          <div className="border-b border-pink-200 pb-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <h1 className="text-sm sm:text-base font-black text-slate-800 tracking-wide flex items-center gap-2 flex-wrap">
+              <span>
+                {selectedCategory === 'all' 
+                  ? 'อัปเดตใหม่วันนี้ • การ์ตูน มังงะ มังฮวา' 
+                  : `หมวดหมู่ ${selectedCategory}`} ({sortedAndFilteredComics.length} เรื่อง)
+              </span>
+              <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-pink-100 text-[#db2777] font-bold">
+                {sortBy === 'latest_update' ? '🔥 ตอนใหม่ล่าสุดอยู่บนสุด' : 'จัดเรียงตามที่เลือก'}
+              </span>
+            </h1>
 
-        {/* Catalog Section Header */}
-        <div className="border-b border-pink-200 pb-2 flex items-center justify-between">
-          <h1 className="text-sm sm:text-base font-black text-slate-800 tracking-wide flex items-center gap-2">
-            <span>อ่านการ์ตูน มังงะ มังฮวาออนไลน์ ({filteredComics.length} เรื่อง)</span>
-            <span className="text-[10px] px-2 py-0.5 rounded-full bg-pink-100 text-[#db2777] font-bold">
-              เรื่องราวต่อเนื่อง เหมือนนักเขียนมืออาชีพ
-            </span>
-          </h1>
+            {/* Sort Control Dropdown */}
+            <div className="flex items-center gap-2 text-xs self-start sm:self-auto">
+              <span className="text-slate-500 font-semibold flex items-center gap-1">
+                <ArrowUpDown className="w-3.5 h-3.5 text-pink-500" />
+                <span>จัดเรียง:</span>
+              </span>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className="bg-white border-2 border-pink-200 hover:border-pink-300 rounded-xl px-2.5 py-1 text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-pink-300 shadow-2xs cursor-pointer"
+              >
+                <option value="latest_update">🔥 อัปเดตตอนใหม่ล่าสุด (วันนี้)</option>
+                <option value="rating">⭐ คะแนนเรตติ้งสูงสุด</option>
+                <option value="views">👁️ ยอดเข้าชมมากที่สุด</option>
+                <option value="chapters">📚 จำนวนตอนมากที่สุด</option>
+                <option value="title">🔤 ชื่อเรื่อง (ก-ฮ / A-Z)</option>
+              </select>
+            </div>
+          </div>
         </div>
 
         {/* Comic Grid (2 columns on mobile, expanding up to 5 on desktop) */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 sm:gap-4 pt-1">
-          {filteredComics.map((comic) => (
-            <ComicCard
-              key={comic.id}
-              comic={comic}
-              onSelect={(c) => setSelectedComic(c)}
-              onStartReading={(c) => {
-                setActiveReading({ comic: c, chapter: c.chapters[0] });
+        {sortedAndFilteredComics.length === 0 ? (
+          <div className="py-16 text-center bg-white rounded-2xl border border-pink-200 p-6 space-y-3">
+            <p className="text-sm font-bold text-slate-600">ไม่พบการ์ตูนในหมวดหมู่นี้</p>
+            <button
+              onClick={() => {
+                setSelectedCategory('all');
+                setSearchQuery('');
               }}
-            />
-          ))}
-        </div>
+              className="px-4 py-1.5 bg-[#db2777] text-white text-xs font-bold rounded-xl shadow-xs hover:bg-[#be185d]"
+            >
+              แสดงทั้งหมด
+            </button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3 sm:gap-4 pt-1">
+            {sortedAndFilteredComics.map((comic) => (
+              <ComicCard
+                key={comic.id}
+                comic={comic}
+                onSelect={(c) => setSelectedComic(c)}
+                onStartReading={(c) => {
+                  setActiveReading({ comic: c, chapter: c.chapters[0] });
+                }}
+              />
+            ))}
+          </div>
+        )}
       </main>
 
       {/* Active Sponsor Popup Banner */}
@@ -479,6 +576,7 @@ export default function App() {
         onLogin={setCurrentUser}
         onLogout={() => setCurrentUser(null)}
       />
+
     </div>
   );
 }
